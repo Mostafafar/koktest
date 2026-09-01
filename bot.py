@@ -1,9 +1,10 @@
 # ==================== bot.py - ربات کامل مطالعه هوشمند ====================
-# نسخه نهایی با سیستم سطوح تولید برنامه توسط AI
+# نسخه نهایی با سیستم سطوح و چت AI
 
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, date
@@ -15,6 +16,7 @@ from psycopg2 import pool, sql
 import jdatetime
 import pytz
 import httpx
+from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -27,23 +29,26 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
-from openai import OpenAI
+from openai import AsyncOpenAI
+import asyncio
 
-# ==================== تنظیمات ====================
-TOKEN = "8121929322:AAGlD1LAXROb2DG_34rY94Yl6cFBA4pZsBA"
-AI_API_KEY = "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"
-AI_BASE_URL = "https://api.chatqt.com/api/v1"
-AI_MODEL = "deepseek/deepseek-v4-flash"
+# ==================== بارگذاری تنظیمات از محیط ====================
+load_dotenv()
 
-ADMIN_IDS = [6680287530]
+TOKEN = os.getenv("BOT_TOKEN")
+AI_API_KEY = os.getenv("AI_API_KEY")
+AI_BASE_URL = os.getenv("AI_BASE_URL")
+AI_MODEL = os.getenv("AI_MODEL")
 
 DB_CONFIG = {
-    "host": "localhost",
-    "database": "study_bot_db",
-    "user": "postgres",
-    "password": "m13821382",
-    "port": "5432"
+    "host": os.getenv("DB_HOST", "localhost"),
+    "database": os.getenv("DB_NAME", "study_bot_db"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD"),
+    "port": os.getenv("DB_PORT", "5432")
 }
+
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 
 IRAN_TZ = pytz.timezone('Asia/Tehran')
 
@@ -69,11 +74,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== OpenAI Client ====================
-client = OpenAI(
-    base_url=AI_BASE_URL, 
+# ==================== AsyncOpenAI Client ====================
+client = AsyncOpenAI(
+    base_url=AI_BASE_URL,
     api_key=AI_API_KEY,
-    timeout=httpx.Timeout(120.0, connect=60.0)
+    timeout=httpx.Timeout(30.0, connect=10.0)
 )
 
 # ==================== دیتابیس ====================
@@ -197,7 +202,7 @@ def get_iran_date_for_db() -> str:
 # ==================== ایجاد جداول دیتابیس ====================
 def create_tables():
     queries = [
-        # جدول users با ستون plan_level اضافه شده
+        # جدول users
         """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -226,6 +231,7 @@ def create_tables():
             version INTEGER DEFAULT 1
         )
         """,
+        # جدول subject_status
         """
         CREATE TABLE IF NOT EXISTS subject_status (
             id SERIAL PRIMARY KEY,
@@ -258,6 +264,7 @@ def create_tables():
             UNIQUE(user_id, subject)
         )
         """,
+        # جدول activity_log
         """
         CREATE TABLE IF NOT EXISTS activity_log (
             id SERIAL PRIMARY KEY,
@@ -291,6 +298,7 @@ def create_tables():
             is_archived BOOLEAN DEFAULT FALSE
         )
         """,
+        # جدول advisory_rules
         """
         CREATE TABLE IF NOT EXISTS advisory_rules (
             id SERIAL PRIMARY KEY,
@@ -315,6 +323,7 @@ def create_tables():
             version INTEGER DEFAULT 1
         )
         """,
+        # جدول study_sessions با UNIQUE
         """
         CREATE TABLE IF NOT EXISTS study_sessions (
             session_id SERIAL PRIMARY KEY,
@@ -330,9 +339,11 @@ def create_tables():
             time_slots TEXT,
             topics TEXT,
             archived BOOLEAN DEFAULT FALSE,
-            plan_level INT DEFAULT 0
+            plan_level INT DEFAULT 0,
+            UNIQUE(user_id, date)
         )
         """,
+        # جدول study_parts
         """
         CREATE TABLE IF NOT EXISTS study_parts (
             part_id SERIAL PRIMARY KEY,
@@ -359,6 +370,7 @@ def create_tables():
             reason TEXT
         )
         """,
+        # جدول user_insights
         """
         CREATE TABLE IF NOT EXISTS user_insights (
             id SERIAL PRIMARY KEY,
@@ -377,6 +389,7 @@ def create_tables():
             UNIQUE(user_id, analysis_date)
         )
         """,
+        # جدول daily_alerts
         """
         CREATE TABLE IF NOT EXISTS daily_alerts (
             id SERIAL PRIMARY KEY,
@@ -388,6 +401,7 @@ def create_tables():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """,
+        # جدول personalized_plans
         """
         CREATE TABLE IF NOT EXISTS personalized_plans (
             id SERIAL PRIMARY KEY,
@@ -405,6 +419,28 @@ def create_tables():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, date)
         )
+        """,
+        # جدول chat_messages برای تاریخچه چت
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            role VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            tokens_used INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        # جدول user_quota برای سقف مصرف
+        """
+        CREATE TABLE IF NOT EXISTS user_quota (
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE PRIMARY KEY,
+            daily_messages INTEGER DEFAULT 0,
+            last_reset DATE DEFAULT CURRENT_DATE,
+            plan_type VARCHAR(20) DEFAULT 'trial',
+            plan_expiry DATE,
+            UNIQUE(user_id)
+        )
         """
     ]
     
@@ -414,30 +450,39 @@ def create_tables():
         except Exception as e:
             logger.warning(f"خطا در ایجاد جدول: {e}")
     
-    # اضافه کردن ستون plan_level به جدول users اگر وجود نداشته باشد
+    # ایجاد تابع و تریگر برای optimistic locking
     try:
-        execute_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_level INTEGER DEFAULT 0")
+        execute_query("""
+            CREATE OR REPLACE FUNCTION update_version()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.version = OLD.version + 1;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+        
+        # تریگر برای جدول users
+        execute_query("""
+            DROP TRIGGER IF EXISTS update_users_version ON users;
+            CREATE TRIGGER update_users_version
+            BEFORE UPDATE ON users
+            FOR EACH ROW
+            EXECUTE FUNCTION update_version();
+        """)
+        
+        # تریگر برای جدول subject_status
+        execute_query("""
+            DROP TRIGGER IF EXISTS update_subject_version ON subject_status;
+            CREATE TRIGGER update_subject_version
+            BEFORE UPDATE ON subject_status
+            FOR EACH ROW
+            EXECUTE FUNCTION update_version();
+        """)
     except Exception as e:
-        logger.warning(f"خطا در افزودن ستون plan_level: {e}")
+        logger.warning(f"خطا در ایجاد تریگر: {e}")
     
-    # اضافه کردن ستون reason به جدول study_parts اگر وجود نداشته باشد
-    try:
-        execute_query("ALTER TABLE study_parts ADD COLUMN IF NOT EXISTS reason TEXT")
-    except Exception as e:
-        logger.warning(f"خطا در افزودن ستون reason: {e}")
-    
-    # اضافه کردن ستون alert_sent به جدول study_parts اگر وجود نداشته باشد
-    try:
-        execute_query("ALTER TABLE study_parts ADD COLUMN IF NOT EXISTS alert_sent BOOLEAN DEFAULT FALSE")
-    except Exception as e:
-        logger.warning(f"خطا در افزودن ستون alert_sent: {e}")
-    
-    # اضافه کردن ستون plan_level به جدول study_sessions اگر وجود نداشته باشد
-    try:
-        execute_query("ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS plan_level INTEGER DEFAULT 0")
-    except Exception as e:
-        logger.warning(f"خطا در افزودن ستون plan_level به study_sessions: {e}")
-    
+    # ایندکس‌ها
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id)",
         "CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)",
@@ -448,7 +493,9 @@ def create_tables():
         "CREATE INDEX IF NOT EXISTS idx_sessions_user ON study_sessions(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_parts_session ON study_parts(session_id)",
         "CREATE INDEX IF NOT EXISTS idx_insights_user ON user_insights(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_user ON daily_alerts(user_id)"
+        "CREATE INDEX IF NOT EXISTS idx_alerts_user ON daily_alerts(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at)"
     ]
     
     for idx in indexes:
@@ -463,9 +510,8 @@ def create_tables():
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        ["📝 برنامه امروز"],
-        ["📊 گزارش"],
-        ["📅 تقویم"]
+        ["📝 برنامه امروز", "💬 چت با AI"],
+        ["📊 گزارش", "📅 تقویم"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -564,6 +610,13 @@ def get_duration_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+def get_ai_chat_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        ["🔄 مکالمه جدید", "🔙 بازگشت به منو"],
+        ["📊 مصرف امروز"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 # ==================== توابع کاربری ====================
 def get_user_id_by_telegram(telegram_id: int) -> Optional[int]:
     result = execute_query(
@@ -578,7 +631,7 @@ def get_user_data(telegram_id: int) -> Optional[Dict]:
         """SELECT id, telegram_id, username, full_name, goal, grade, field, 
                   is_onboarded, current_phase, weak_subjects, strong_subjects,
                   study_hours_per_week, peak_time, learning_style, focus_duration,
-                  break_duration, plan_level, created_at
+                  break_duration, plan_level, created_at, version
            FROM users WHERE telegram_id = %s""",
         (str(telegram_id),),
         fetch=True
@@ -603,7 +656,8 @@ def get_user_data(telegram_id: int) -> Optional[Dict]:
         "focus_duration": result[14] or 45,
         "break_duration": result[15] or 10,
         "plan_level": result[16] or 0,
-        "created_at": result[17]
+        "created_at": result[17],
+        "version": result[18] or 1
     }
 
 def get_plan_by_date(user_id: int, date_str: str) -> Optional[Dict]:
@@ -863,6 +917,116 @@ def get_last_n_days_data(user_id: int, days: int = 7) -> List[Dict]:
         for r in results
     ] if results else []
 
+# ==================== توابع چت AI و سقف مصرف ====================
+
+AI_CHAT_SYSTEM_PROMPT = """تو دستیار مطالعه‌ی هوشمند هستی. فقط درباره‌ی:
+- درس خوندن و تکنیک‌های مطالعه
+- برنامه‌ریزی تحصیلی
+- مدیریت زمان
+- انگیزه‌دهی
+- مشاوره تحصیلی
+
+صحبت کن. پاسخ‌ها مختصر، مفید و به فارسی روان باشن.
+اگر سوال خارج از موضوع بود، مؤدبانه کاربر رو به موضوع مطالعه برگردون.
+از اطلاعات کاربر برای شخصی‌سازی پاسخ‌ها استفاده کن."""
+
+def init_user_quota(user_id: int) -> None:
+    """ایجاد سقف مصرف برای کاربر جدید"""
+    try:
+        execute_query(
+            """INSERT INTO user_quota (user_id, daily_messages, last_reset, plan_type)
+               VALUES (%s, 0, %s, 'trial')""",
+            (user_id, get_today_date())
+        )
+    except:
+        pass
+
+def get_user_quota(user_id: int) -> Optional[Dict]:
+    """دریافت اطلاعات سقف مصرف کاربر"""
+    result = execute_query(
+        """SELECT daily_messages, last_reset, plan_type, plan_expiry 
+           FROM user_quota WHERE user_id = %s""",
+        (user_id,),
+        fetch=True
+    )
+    if not result:
+        return None
+    return {
+        "daily_messages": result[0] or 0,
+        "last_reset": result[1],
+        "plan_type": result[2] or "trial",
+        "plan_expiry": result[3]
+    }
+
+def get_remaining_messages(user_id: int) -> int:
+    """محاسبه تعداد پیام‌های باقی‌مانده امروز"""
+    quota = get_user_quota(user_id)
+    if not quota:
+        return 10  # دوره آزمایشی
+    
+    today = get_today_date()
+    if str(quota["last_reset"]) != today:
+        # ریست روزانه
+        execute_query(
+            "UPDATE user_quota SET daily_messages = 0, last_reset = %s WHERE user_id = %s",
+            (today, user_id)
+        )
+        quota["daily_messages"] = 0
+    
+    # تعیین سقف بر اساس نوع اشتراک
+    if quota["plan_type"] == "trial":
+        limit = 10
+    elif quota["plan_type"] == "basic":
+        limit = 15
+    elif quota["plan_type"] == "premium":
+        limit = 30
+    else:
+        limit = 10
+    
+    remaining = limit - quota["daily_messages"]
+    return max(0, remaining)
+
+def increment_quota(user_id: int) -> bool:
+    """افزایش شمارش مصرف و بازگشت موفقیت"""
+    try:
+        execute_query(
+            "UPDATE user_quota SET daily_messages = daily_messages + 1 WHERE user_id = %s",
+            (user_id,)
+        )
+        return True
+    except:
+        return False
+
+def save_chat_message(user_id: int, role: str, content: str, tokens_used: int = 0) -> None:
+    """ذخیره پیام در تاریخچه چت"""
+    try:
+        execute_query(
+            """INSERT INTO chat_messages (user_id, role, content, tokens_used)
+               VALUES (%s, %s, %s, %s)""",
+            (user_id, role, content, tokens_used)
+        )
+    except Exception as e:
+        logger.error(f"خطا در ذخیره پیام چت: {e}")
+
+def get_chat_history(user_id: int, limit: int = 10) -> List[Dict]:
+    """دریافت تاریخچه چت کاربر"""
+    results = execute_query(
+        """SELECT role, content FROM chat_messages 
+           WHERE user_id = %s 
+           ORDER BY created_at DESC LIMIT %s""",
+        (user_id, limit * 2),
+        fetchall=True
+    )
+    if not results:
+        return []
+    # برگرداندن به ترتیب زمانی (قدیمی‌ترین اول)
+    reversed_results = list(reversed(results))
+    return [{"role": r[0], "content": r[1]} for r in reversed_results]
+
+def clear_chat_history(user_id: int) -> None:
+    """پاک کردن تاریخچه چت کاربر"""
+    execute_query("DELETE FROM chat_messages WHERE user_id = %s", (user_id,))
+
 # ==================== توابع ذخیره‌سازی ====================
 def save_user(user_data: Dict) -> Optional[int]:
     query = """
@@ -917,6 +1081,32 @@ def save_user(user_data: Dict) -> Optional[int]:
         fetch=True
     )
     return result[0] if result else None
+
+def update_user_plan_level(user_id: int, level: int) -> bool:
+    """به‌روزرسانی با optimistic locking"""
+    current = execute_query(
+        "SELECT version FROM users WHERE id = %s",
+        (user_id,),
+        fetch=True
+    )
+    if not current:
+        return False
+    
+    current_version = current[0]
+    
+    result = execute_query(
+        """UPDATE users 
+           SET plan_level = %s, 
+               updated_at = CURRENT_TIMESTAMP,
+               version = version + 1
+           WHERE id = %s AND version = %s""",
+        (level, user_id, current_version)
+    )
+    
+    if result == 0:
+        logger.warning(f"Optimistic lock failed for user {user_id}")
+        return False
+    return True
 
 def save_activity(activity_data: Dict) -> Optional[int]:
     query = """
@@ -1237,12 +1427,6 @@ def finish_session(session_id: int) -> None:
     execute_query(
         "UPDATE study_sessions SET is_finished = TRUE, archived = TRUE WHERE session_id = %s",
         (session_id,)
-    )
-
-def update_user_plan_level(user_id: int, level: int) -> None:
-    execute_query(
-        "UPDATE users SET plan_level = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-        (level, user_id)
     )
 
 def update_part_times_and_shift_remaining(session_id: int, completed_part_id: int, actual_end_time: datetime) -> None:
@@ -1694,10 +1878,29 @@ def generate_plan_prompt_level_3(user_data: Dict, user_id: int,
   ]
 }}"""
 
-# ==================== تولید برنامه با AI بر اساس سطح ====================
+# ==================== تولید برنامه با AI بر اساس سطح (Async) ====================
 
-def generate_plan_with_ai(user_id: int, user_data: Dict) -> Dict:
-    """تولید برنامه بر اساس سطح کاربر"""
+async def call_ai(prompt: str, max_tokens: int = 1500, temperature: float = 0.3) -> Optional[str]:
+    """فراخوانی async با timeout و retry"""
+    for attempt in range(3):
+        try:
+            completion = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"AI error (attempt {attempt+1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                return None
+    return None
+
+async def generate_plan_with_ai(user_id: int, user_data: Dict) -> Dict:
+    """تولید برنامه با AI به صورت async"""
     level = user_data.get('plan_level', 0)
     
     subject_status = get_subject_status(user_id)
@@ -1716,17 +1919,27 @@ def generate_plan_with_ai(user_id: int, user_data: Dict) -> Dict:
     else:
         prompt = generate_plan_prompt_level_3(user_data, user_id, insights or {}, advice)
     
+    response = await call_ai(prompt, max_tokens=1200, temperature=0.3)
+    if not response:
+        return {}
+    
     try:
-        response = call_ai(prompt, max_tokens=1200, temperature=0.3)
-        if not response:
-            return {}
-        
         json_match = re.search(r'\{.*\}', response, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
         return {}
     except Exception as e:
-        logger.error(f"❌ خطا در تولید برنامه با AI: {e}")
+        logger.error(f"❌ خطا در پارس JSON: {e}")
+        # تلاش مجدد با پرامپت اصلاحی
+        fix_prompt = f"خروجی قبلی JSON معتبر نبود. لطفاً فقط JSON خالص برگردان. خطا: {e}\nخروجی قبلی: {response[:200]}..."
+        fixed_response = await call_ai(fix_prompt, max_tokens=800, temperature=0.1)
+        if fixed_response:
+            try:
+                json_match = re.search(r'\{.*\}', fixed_response, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+            except:
+                pass
         return {}
 
 def create_plan_from_ai_response(user_id: int, user_data: Dict, ai_response: Dict) -> Optional[int]:
@@ -1806,19 +2019,6 @@ def create_plan_from_ai_response(user_id: int, user_data: Dict, ai_response: Dic
         return session_id
     
     return None
-
-def call_ai(prompt: str, max_tokens: int = 1500, temperature: float = 0.3) -> Optional[str]:
-    try:
-        completion = client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        logger.error(f"❌ خطا در AI: {e}")
-        return None
 
 # ==================== تایمر ====================
 active_timers = {}
@@ -1913,9 +2113,6 @@ async def update_timer(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"خطا در آپدیت تایمر: {e}")
 
-# ==================== ادامه کد در قسمت بعد ====================
-# ==================== ادامه کد ====================
-
 # ==================== هندلرهای اصلی ====================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1929,11 +2126,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         level_name = get_plan_level_name(level)
         level_emoji = get_plan_level_emoji(level)
         
+        # ایجاد سقف مصرف برای کاربر
+        if not get_user_quota(user_data["id"]):
+            init_user_quota(user_data["id"])
+        
         await update.message.reply_text(
             f"🎯 سلام {user.full_name}! به کمپ خوش آمدید.\n\n"
             f"📚 امروز {get_today_shamsi()} - ساعت {get_iran_time_str()}\n"
-            f"📊 سطح برنامه: {level_emoji} {level_name}\n\n"
-            "برای شروع، دکمه <b>📝 برنامه امروز</b> رو بزن.",
+            f"📊 سطح برنامه: {level_emoji} {level_name}\n"
+            f"💬 پیام‌های باقی‌مانده AI: {get_remaining_messages(user_data['id'])}\n\n"
+            "برای شروع، دکمه‌های منو رو بزن.",
             reply_markup=get_main_keyboard(),
             parse_mode=ParseMode.HTML
         )
@@ -2085,12 +2287,16 @@ async def onboarding_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_id = save_user(data)
         
         if user_id:
+            # ایجاد سقف مصرف برای کاربر جدید
+            init_user_quota(user_id)
+            
             await update.message.reply_text(
                 "✅ **ثبت‌نام شما با موفقیت انجام شد!**\n\n"
                 f"📚 هدف: {data.get('goal')}\n"
                 f"🎓 پایه: {data.get('grade')}\n"
                 f"🧪 رشته: {data.get('field')}\n"
-                f"🌱 سطح برنامه: اولیه\n\n"
+                f"🌱 سطح برنامه: اولیه\n"
+                f"💬 ۱۰ پیام رایگان AI برای آزمایش\n\n"
                 "🧠 در حال ساخت برنامه اولیه...",
                 reply_markup=get_main_keyboard(),
                 parse_mode=ParseMode.HTML
@@ -2105,12 +2311,16 @@ async def onboarding_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def generate_initial_plan(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                 user_id: int, user_data: Dict) -> None:
-    """تولید برنامه اولیه با سطح ۰"""
+    """تولید برنامه اولیه با سطح ۰ - async"""
     level = calculate_plan_level(user_id)
     user_data['plan_level'] = level
     update_user_plan_level(user_id, level)
     
-    ai_response = generate_plan_with_ai(user_id, user_data)
+    wait_msg = await update.message.reply_text("🧠 در حال ساخت برنامه شخصی‌سازی‌شده...")
+    
+    ai_response = await generate_plan_with_ai(user_id, user_data)
+    
+    await wait_msg.delete()
     
     if ai_response and ai_response.get('subjects'):
         session_id = create_plan_from_ai_response(user_id, user_data, ai_response)
@@ -2527,9 +2737,6 @@ async def confirm_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user_id:
         level = calculate_plan_level(user_id)
         update_user_plan_level(user_id, level)
-        user_data = get_user_data(str(update.effective_user.id))
-        if user_data:
-            user_data['plan_level'] = level
     
     level = context.user_data.get("current_plan", {}).get("plan_level", 0)
     level_name = get_plan_level_name(level)
@@ -2844,7 +3051,9 @@ async def handle_today_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_data['plan_level'] = level
     update_user_plan_level(user_id, level)
     
-    ai_response = generate_plan_with_ai(user_id, user_data)
+    wait_msg = await update.message.reply_text("🧠 در حال ساخت برنامه شخصی‌سازی‌شده...")
+    ai_response = await generate_plan_with_ai(user_id, user_data)
+    await wait_msg.delete()
     
     if ai_response and ai_response.get('subjects'):
         session_id = create_plan_from_ai_response(user_id, user_data, ai_response)
@@ -2861,6 +3070,168 @@ async def handle_today_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup=get_plan_keyboard(),
         parse_mode=ParseMode.HTML
     )
+
+# ==================== چت با AI ====================
+
+async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ورود به حالت چت AI"""
+    user_id = get_user_id_by_telegram(update.effective_user.id)
+    if not user_id:
+        await update.message.reply_text("❌ لطفاً اول /start رو بزن.")
+        return
+    
+    # بررسی سقف مصرف
+    if not get_user_quota(user_id):
+        init_user_quota(user_id)
+    
+    remaining = get_remaining_messages(user_id)
+    
+    if remaining <= 0:
+        await update.message.reply_text(
+            "⛔️ **سقف پیام رایگان امروزت تموم شده!**\n\n"
+            "📊 پیام‌های باقی‌مانده: ۰\n"
+            "💡 برای ادامه چت با AI، اشتراک تهیه کن.\n\n"
+            "💰 هزینه اشتراک یک ماهه: ۵۰۰,۰۰۰ تومان\n"
+            "📱 شماره کارت: **۶۲۱۹۸۶۱۸۳۷۵۶۹۶۸۹**\n"
+            "👤 به نام: **مصطفی فرخندئی**\n\n"
+            "📸 بعد از واریز، عکس رسید رو بفرست تا اشتراکت فعال بشه.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    context.user_data["mode"] = "ai_chat"
+    
+    user_data = get_user_data(str(update.effective_user.id))
+    context_summary = ""
+    if user_data:
+        weak = ", ".join(user_data.get("weak_subjects", [])) or "ندارد"
+        context_summary = f"هدف کاربر: {user_data.get('goal', 'نامشخص')} | درس ضعیف: {weak}"
+    
+    # ذخیره context در user_data برای استفاده در مکالمه
+    context.user_data["ai_context_summary"] = context_summary
+    
+    await update.message.reply_text(
+        f"💬 **چت با دستیار هوشمند مطالعه**\n\n"
+        f"📚 هر سوالی درباره درس و برنامه‌ریزی داری بپرس.\n"
+        f"🔄 برای شروع مکالمه جدید از دکمه استفاده کن.\n"
+        f"🔙 برای خروج به منو برگرد.\n\n"
+        f"📊 **پیام‌های باقی‌مانده امروز**: {remaining}\n"
+        f"📌 {context_summary}",
+        reply_markup=get_ai_chat_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
+
+async def handle_ai_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """پردازش پیام در حالت چت AI"""
+    user_id = get_user_id_by_telegram(update.effective_user.id)
+    if not user_id:
+        await update.message.reply_text("❌ لطفاً اول /start رو بزن.")
+        context.user_data["mode"] = None
+        return
+    
+    text = update.message.text.strip()
+    
+    # بررسی دکمه‌های خاص چت
+    if text == "🔙 بازگشت به منو":
+        context.user_data["mode"] = None
+        context.user_data.pop("ai_context_summary", None)
+        await update.message.reply_text("🔙 برگشتی به منو 👇", reply_markup=get_main_keyboard())
+        return
+    
+    if text == "🔄 مکالمه جدید":
+        clear_chat_history(user_id)
+        await update.message.reply_text(
+            "🔄 مکالمه جدید شروع شد 🌱\n"
+            "حالا سوالت رو بپرس.",
+            reply_markup=get_ai_chat_keyboard()
+        )
+        return
+    
+    if text == "📊 مصرف امروز":
+        remaining = get_remaining_messages(user_id)
+        quota = get_user_quota(user_id)
+        plan_type = quota.get("plan_type", "trial") if quota else "trial"
+        plan_names = {"trial": "آزمایشی", "basic": "پایه", "premium": "پیشرفته"}
+        await update.message.reply_text(
+            f"📊 **مصرف امروز**\n\n"
+            f"📌 نوع اشتراک: {plan_names.get(plan_type, 'آزمایشی')}\n"
+            f"💬 پیام‌های باقی‌مانده: {remaining}\n"
+            f"📅 تاریخ: {get_today_shamsi()}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # بررسی طول پیام
+    if len(text) > 1000:
+        await update.message.reply_text(
+            "⚠️ لطفاً پیام کوتاه‌تری بفرست (حداکثر ۱۰۰۰ کاراکتر)."
+        )
+        return
+    
+    # بررسی مجدد سقف مصرف
+    remaining = get_remaining_messages(user_id)
+    if remaining <= 0:
+        await update.message.reply_text(
+            "⛔️ سقف پیام امروزت تموم شده!\n"
+            "برای ادامه، اشتراک تهیه کن یا فردا دوباره امتحان کن."
+        )
+        context.user_data["mode"] = None
+        await update.message.reply_text("🔙 برگشتی به منو", reply_markup=get_main_keyboard())
+        return
+    
+    # دریافت تاریخچه چت
+    history = get_chat_history(user_id, limit=10)  # ۵ رفت و برگشت آخر
+    
+    # ساخت messages
+    messages = [{"role": "system", "content": AI_CHAT_SYSTEM_PROMPT}]
+    
+    # اضافه کردن context کاربر
+    context_summary = context.user_data.get("ai_context_summary", "")
+    if context_summary:
+        messages[0]["content"] += f"\n\nاطلاعات کاربر: {context_summary}"
+    
+    messages += history
+    messages.append({"role": "user", "content": text})
+    
+    # ارسال نشان تایپینگ
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    
+    # فراخوانی AI
+    try:
+        start_time = time.time()
+        completion = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            max_tokens=600,
+            temperature=0.6
+        )
+        elapsed = time.time() - start_time
+        
+        reply = completion.choices[0].message.content
+        tokens_used = completion.usage.total_tokens if hasattr(completion, 'usage') else 0
+        
+        # ذخیره در تاریخچه
+        save_chat_message(user_id, "user", text)
+        save_chat_message(user_id, "assistant", reply, tokens_used)
+        
+        # افزایش مصرف
+        increment_quota(user_id)
+        
+        remaining_after = get_remaining_messages(user_id)
+        
+        # ارسال پاسخ
+        await update.message.reply_text(
+            f"{reply}\n\n"
+            f"📊 {remaining_after} پیام امروز باقی مونده",
+            parse_mode=ParseMode.HTML
+        )
+        
+    except Exception as e:
+        logger.error(f"خطا در چت AI: {e}")
+        await update.message.reply_text(
+            "⚠️ مشکلی در ارتباط با AI پیش اومد.\n"
+            "لطفاً چند لحظه بعد دوباره امتحان کن."
+        )
 
 # ==================== گزارش ====================
 
@@ -2919,6 +3290,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         level_name = get_plan_level_name(level)
         level_emoji = get_plan_level_emoji(level)
         text += f"\n📊 سطح برنامه: {level_emoji} {level_name}"
+        
+        # نمایش مصرف AI
+        remaining = get_remaining_messages(user_id)
+        text += f"\n💬 پیام‌های AI باقی‌مانده: {remaining}"
     
     await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode=ParseMode.HTML)
 
@@ -2936,7 +3311,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📊 /stats - آمار کلی\n"
         "🧠 /testai - تست AI\n"
         "📋 /listadvice - لیست توصیه‌ها\n"
-        "🗑 /removeadvice [id] - حذف توصیه",
+        "🗑 /removeadvice [id] - حذف توصیه\n"
+        "📊 /aistats - آمار مصرف AI",
         parse_mode=ParseMode.HTML
     )
 
@@ -3028,12 +3404,43 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     onboarded = execute_query("SELECT COUNT(*) FROM users WHERE is_onboarded = TRUE", fetch=True)
     activities = execute_query("SELECT COUNT(*) FROM activity_log", fetch=True)
     advice = execute_query("SELECT COUNT(*) FROM advisory_rules WHERE is_active = TRUE", fetch=True)
+    chat_msgs = execute_query("SELECT COUNT(*) FROM chat_messages", fetch=True)
     
     text = "📊 **آمار کلی**\n\n"
     text += f"👥 کل کاربران: {users[0] if users else 0}\n"
     text += f"✅ ثبت‌نام‌شده: {onboarded[0] if onboarded else 0}\n"
     text += f"📋 فعالیت‌ها: {activities[0] if activities else 0}\n"
     text += f"💡 توصیه‌های فعال: {advice[0] if advice else 0}\n"
+    text += f"💬 پیام‌های چت: {chat_msgs[0] if chat_msgs else 0}\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def ai_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ دسترسی denied.")
+        return
+    
+    # آمار مصرف AI
+    results = execute_query(
+        """SELECT u.telegram_id, u.full_name, q.plan_type, q.daily_messages, q.last_reset,
+                  COUNT(c.id) as total_chats
+           FROM user_quota q
+           LEFT JOIN users u ON u.id = q.user_id
+           LEFT JOIN chat_messages c ON c.user_id = q.user_id AND c.role = 'assistant'
+           GROUP BY u.telegram_id, u.full_name, q.plan_type, q.daily_messages, q.last_reset
+           ORDER BY q.daily_messages DESC
+           LIMIT 20""",
+        fetchall=True
+    )
+    
+    if not results:
+        await update.message.reply_text("📭 هنوز مصرفی ثبت نشده.")
+        return
+    
+    text = "📊 **آمار مصرف AI**\n\n"
+    for r in results:
+        text += f"👤 {r[1] or r[0]}: {r[2] or 'trial'} | امروز: {r[3] or 0} | کل: {r[5] or 0}\n"
+    
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def test_ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3045,7 +3452,7 @@ async def test_ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("🧠 در حال تست AI...")
     try:
         start = time.time()
-        response = call_ai("سلام، فقط بگو 'AI وصل است' به فارسی", max_tokens=20, temperature=0.1)
+        response = await call_ai("سلام، فقط بگو 'AI وصل است' به فارسی", max_tokens=20, temperature=0.1)
         elapsed = time.time() - start
         if response:
             await update.message.reply_text(
@@ -3069,6 +3476,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await handle_report(update, context)
     elif text == "📅 تقویم":
         await handle_calendar(update, context)
+    elif text == "💬 چت با AI":
+        await handle_ai_chat(update, context)
     else:
         await update.message.reply_text("❓ لطفاً از دکمه‌های منو استفاده کن.", reply_markup=get_main_keyboard())
 
@@ -3100,6 +3509,11 @@ async def handle_text_other(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = get_user_id_by_telegram(update.effective_user.id)
     if not user_id:
         await update.message.reply_text("❌ لطفاً اول /start رو بزن.")
+        return
+    
+    # بررسی حالت چت AI
+    if context.user_data.get("mode") == "ai_chat":
+        await handle_ai_chat_message(update, context)
         return
     
     step = context.user_data.get("onboarding_step")
@@ -3164,6 +3578,13 @@ async def handle_text_other(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if context.user_data.get("step") == "free_edit":
         await handle_free_edit(update, context, text)
         return
+    
+    # پردازش متن آزاد
+    await update.message.reply_text(
+        "❓ دستور نامعتبر.\n"
+        "لطفاً از دکمه‌های منو استفاده کن.",
+        reply_markup=get_main_keyboard()
+    )
 
 async def handle_free_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     plan = context.user_data.get("current_plan", {})
@@ -3255,7 +3676,7 @@ def process_admin_advice_with_ai(admin_text: str) -> List[Dict]:
     "frequency": "daily"
   }}
 ]"""
-    response = call_ai(prompt, max_tokens=1000, temperature=0.2)
+    response = asyncio.run(call_ai(prompt, max_tokens=1000, temperature=0.2))
     if not response:
         return []
     try:
@@ -3333,9 +3754,10 @@ def main() -> None:
     application.add_handler(CommandHandler("listadvice", list_advice_command))
     application.add_handler(CommandHandler("removeadvice", remove_advice_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("aistats", ai_stats_command))
     application.add_handler(CommandHandler("testai", test_ai_command))
     
-    application.add_handler(MessageHandler(filters.Regex("^(📝 برنامه امروز|📊 گزارش|📅 تقویم)$"), handle_main_menu))
+    application.add_handler(MessageHandler(filters.Regex("^(📝 برنامه امروز|📊 گزارش|📅 تقویم|💬 چت با AI)$"), handle_main_menu))
     application.add_handler(MessageHandler(filters.Regex(r"^📅 \d{4}/\d{2}/\d{2}$"), handle_calendar_date))
     application.add_handler(MessageHandler(
         filters.Regex("^(✅ تایید برنامه|✅ اتمام برنامه|✏️ ویرایش برنامه|✏️ ویرایش دستی|✏️ ویرایش آزاد|➕ اضافه کردن|🔄 بازنشانی|🔙 بازگشت|⏱ تایمر|⏹ توقف|✅ تکمیل|🗑 حذف پارت)$"),
@@ -3355,7 +3777,7 @@ def main() -> None:
         job_queue.run_repeating(nightly_report, interval=86400, first=seconds_until)
         logger.info("✅ تسک‌های زمان‌بندی‌شده با زمان ایران تنظیم شدند")
     
-    logger.info("🤖 ربات مطالعه هوشمند با سیستم سطوح شروع به کار کرد!")
+    logger.info("🤖 ربات مطالعه هوشمند با سیستم سطوح و چت AI شروع به کار کرد!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
